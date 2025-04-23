@@ -1,5 +1,5 @@
-;; Peer-to-Peer Content Credibility Protocol - Stage 2
-;; Enhanced with rating system and review periods
+;; Peer-to-Peer Content Credibility Protocol
+;; A blockchain-based system for verifying content quality, building creator reputation, and rewarding valuable contributions
 
 ;; Constants
 (define-constant ERR-NOT-ADMIN (err u1))
@@ -11,46 +11,55 @@
 (define-constant ERR-INSUFFICIENT-STAKE (err u7))
 (define-constant ERR-INVALID-PARAMETER (err u8))
 (define-constant ERR-CONTENT-EXISTS (err u9))
-(define-constant MAX-CONTENT-ID u250) ;; Increased limit
+(define-constant MAX-CONTENT-ID u500) ;; Maximum allowed content ID
 
 ;; Data Variables
 (define-data-var protocol-admin principal tx-sender)
 (define-data-var protocol-active bool false)
 (define-data-var current-epoch uint u0)
-(define-data-var minimum-stake uint u250000) ;; 0.25 STX
+(define-data-var minimum-stake uint u500000) ;; 0.5 STX
+(define-data-var reward-pool uint u0)
 (define-data-var current-block-height uint u0) ;; Block height tracking for review periods
 
-;; Content Structure - Enhanced in Stage 2
+;; Content Structure
 (define-map content-registry
     uint
     {
         title: (string-utf8 256),
-        content-hash: (buff 32),    
+        content-hash: (buff 32),    ;; SHA256 hash of the content
         expiration-block: uint,     ;; Review deadline (block height)
+        reward: uint,
         validated: bool,
         quality-score: uint         ;; Score from 0-100
     }
 )
 
-;; Creator Profile Tracking - Extended version
+;; Creator Profile Tracking
 (define-map creator-profiles
     principal
     {
         active-content: uint,
-        validated-content: (list 20 uint), ;; Smaller list in stage 2
+        validated-content: (list 50 uint),
         last-validation: uint,
         total-validated: uint,
-        reputation-score: uint      
+        reputation-score: uint      ;; Cumulative reputation score
     }
 )
 
-;; Review History - New in Stage 2
+;; Review History
 (define-map content-reviews
     {content-id: uint, reviewer: principal}
     {
         rating: uint,               ;; Score given from 0-100
-        reviewed-at: uint
+        reviewed-at: uint,
+        reward-claimed: bool
     }
+)
+
+;; Review Analytics
+(define-map review-analytics
+    uint
+    (list 20 {reviewer: principal, block-height: uint, rating: uint})
 )
 
 ;; Authorization
@@ -72,13 +81,15 @@
         (asserts! (is-admin) ERR-NOT-ADMIN)
         (var-set protocol-active true)
         (var-set current-epoch u0)
+        (var-set reward-pool u0)
         (ok true)))
 
 (define-public (publish-content
     (content-id uint)
     (title (string-utf8 256))
     (content-hash (buff 32))
-    (expiration-block uint))
+    (expiration-block uint)
+    (reward uint))
     (begin
         ;; Validate content-id is within acceptable range
         (asserts! (<= content-id MAX-CONTENT-ID) ERR-INVALID-PARAMETER)
@@ -95,16 +106,26 @@
         ;; Validate title is not empty
         (asserts! (> (len title) u0) ERR-INVALID-PARAMETER)
         
+        ;; Transfer the reward amount to the protocol
+        (try! (stx-transfer? reward tx-sender (var-get protocol-admin)))
+        
         ;; Set the content data
         (map-set content-registry content-id
             {
                 title: title,
                 content-hash: content-hash,
                 expiration-block: expiration-block,
+                reward: reward,
                 validated: false,
                 quality-score: u0
             })
             
+        ;; Calculate new reward pool safely
+        (let ((new-pool (+ (var-get reward-pool) reward)))
+            ;; Make sure the addition doesn't overflow
+            (asserts! (>= new-pool (var-get reward-pool)) ERR-INVALID-PARAMETER)
+            ;; Update the total reward pool
+            (var-set reward-pool new-pool))
         (ok true)))
 
 ;; Reviewer Registration
@@ -125,7 +146,7 @@
             })
         (ok true)))
 
-;; Content Rating Functions - New in Stage 2
+;; Content Rating Functions
 (define-public (submit-rating
     (content-id uint)
     (rating uint)
@@ -158,11 +179,11 @@
                     (merge reviewer {
                         active-content: (+ content-id u1),
                         validated-content: (unwrap! (as-max-len? 
-                            (append (get validated-content reviewer) content-id) u20)
+                            (append (get validated-content reviewer) content-id) u50)
                             ERR-INVALID-CONTENT),
                         last-validation: current-block,
                         total-validated: (+ (get total-validated reviewer) u1),
-                        reputation-score: (+ (get reputation-score reviewer) u5)
+                        reputation-score: (+ (get reputation-score reviewer) u10)
                     }))
                 
                 ;; Record review
@@ -170,11 +191,47 @@
                     {content-id: content-id, reviewer: tx-sender}
                     {
                         rating: rating,
-                        reviewed-at: current-block
+                        reviewed-at: current-block,
+                        reward-claimed: false
                     })
+                
+                ;; Record review analytics
+                (match (map-get? review-analytics content-id)
+                    history (map-set review-analytics content-id
+                        (unwrap! (as-max-len?
+                            (append history {reviewer: tx-sender, block-height: current-block, rating: rating})
+                            u20)
+                            ERR-INVALID-CONTENT))
+                    (map-set review-analytics content-id
+                        (list {reviewer: tx-sender, block-height: current-block, rating: rating})))
                 
                 (ok true))
             ERR-INVALID-RATING-PROOF)))
+
+;; Reward Claim Function
+(define-public (claim-review-reward (content-id uint))
+    (let (
+        (content (unwrap! (map-get? content-registry content-id) ERR-INVALID-CONTENT))
+        (review (unwrap! (map-get? content-reviews {content-id: content-id, reviewer: tx-sender}) ERR-INVALID-CONTENT))
+        )
+        ;; Verify content is validated and reward not claimed
+        (asserts! (get validated content) ERR-INVALID-CONTENT)
+        (asserts! (not (get reward-claimed review)) ERR-CONTENT-ALREADY-RATED)
+        
+        ;; Calculate reward based on rating quality (simplified)
+        (let (
+            (reward-amount (/ (* (get reward content) (get rating review)) u100))
+            )
+            
+            ;; Update review to mark reward as claimed
+            (map-set content-reviews
+                {content-id: content-id, reviewer: tx-sender}
+                (merge review {reward-claimed: true}))
+            
+            ;; Transfer reward to reviewer
+            (try! (stx-transfer? reward-amount (var-get protocol-admin) tx-sender))
+            
+            (ok reward-amount))))
 
 ;; Read-only functions
 (define-read-only (get-content-title (content-id uint))
@@ -187,6 +244,9 @@
 (define-read-only (get-creator-profile (creator principal))
     (map-get? creator-profiles creator))
 
+(define-read-only (get-review-analytics (content-id uint))
+    (map-get? review-analytics content-id))
+
 (define-read-only (get-current-block)
     (var-get current-block-height))
 
@@ -194,6 +254,7 @@
     {
         active: (var-get protocol-active),
         current-epoch: (var-get current-epoch),
+        reward-pool: (var-get reward-pool),
         minimum-stake: (var-get minimum-stake),
         current-block-height: (var-get current-block-height)
     })
